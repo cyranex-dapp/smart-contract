@@ -1,5 +1,5 @@
-
 // SPDX-License-Identifier: MIT
+
 pragma solidity ^0.8.24;
 
 // OpenZeppelin ERC20/Ownable
@@ -19,9 +19,7 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
     IERC20 public immutable usdt;
     CyranexToken public immutable cnxToken;
 
-    address public admin1;
-    address public admin2;
-    address public admin3;
+    address public admin;
 
     uint256 public constant MIN_TOPUP = 50 * 1e18;
     uint256 public constant ADMIN_FEE_BP = 500; // 5%
@@ -54,6 +52,7 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
         uint256 registrationTime;
         Deposit[] deposits;
         uint256 withdrawableBalance;
+        uint256 lastWithdrawTime;
         uint256 totalWithdrawn;
         uint256 totalTopup;
         uint256 totalReferralBonusEarned;
@@ -84,18 +83,14 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
 
     constructor(
         address _usdt,
-        address _admin1,
-        address _admin2,
-        address _admin3,
+        address _admin,
         address _root
     ) Ownable(msg.sender) {
         require(_usdt != address(0), "Invalid USDT");
-        require(_admin1 != address(0) && _admin2 != address(0) && _admin3 != address(0), "Invalid admin");
+        require(_admin != address(0), "Invalid admin");
         require(_root != address(0), "Invalid root");
         usdt = IERC20(_usdt);
-        admin1 = _admin1;
-        admin2 = _admin2;
-        admin3 = _admin3;
+        admin = _admin;
         cnxToken = new CyranexToken(address(this));
         // Set the root user (contract address as referrer)
         users[_root].registered = true;
@@ -125,18 +120,12 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
     function topUp(uint256 amount) external onlyRegistered nonReentrant {
         require(amount >= MIN_TOPUP && amount % MIN_TOPUP == 0, "Invalid top-up amount");
         require(usdt.transferFrom(msg.sender, address(this), amount), "USDT transfer failed");
-
-        uint256 adminFee = (amount * ADMIN_FEE_BP) / 10000;
         
-        usdt.transfer(admin1, (adminFee * 2) / 5);
-        usdt.transfer(admin2, (adminFee * 2) / 5);
-        usdt.transfer(admin3, (adminFee * 1) / 5);
+        usdt.transfer(admin, (amount * ADMIN_FEE_BP) / 10000);
 
         uint256 mintBase = (amount * MINT_PERCENT_BP) / 10000;
         uint256 cnxPrice = getCurrentTokenPrice();
-        uint256 mintCNX = cnxToken.totalSupply() == 0
-            ? (mintBase * 1e18) / INITIAL_TOKEN_PRICE
-            : (mintBase * 1e18) / cnxPrice;
+        uint256 mintCNX = (mintBase * 1e18) / cnxPrice;
         cnxToken.mint(address(this), mintCNX);
 
         users[msg.sender].deposits.push(
@@ -207,37 +196,42 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
 
     // --- Withdraw earnings (capped at 2x total top-up per user) ---
     function withdraw(uint256 amountUSDT) external onlyRegistered nonReentrant {
-        require(amountUSDT >= 10 * 1e18 && amountUSDT % (10 * 1e18) == 0, "Minimum withdrawal is $10 or multiple of $10");
+        require(amountUSDT >= 10 * 1e18 && amountUSDT % (10 * 1e18) == 0, "Minimum withdrawal is $10 or multiple of $10.");        
         User storage user = users[msg.sender];
+        require(block.timestamp >= user.lastWithdrawTime + 1 days, "Can withdraw once in 24 hours.");
         require(user.withdrawableBalance >= amountUSDT, "Insufficient withdrawable");
         require(
             user.totalWithdrawn + amountUSDT <= user.totalTopup * WITHDRAW_CAP_X,
             "2x withdrawal cap reached"
         );
-        uint256 cnxPrice = getCurrentTokenPrice();
-        uint256 cnxAmount = (amountUSDT * 1e18) / cnxPrice;
-        uint256 burnAmount = (cnxAmount * 10) / 100;
-        uint256 adminAmount = (cnxAmount * 5) / 100;
-        uint256 userAmount = cnxAmount - burnAmount - adminAmount;
-        cnxToken.burn(address(this), burnAmount);
-        cnxToken.transfer(admin1, (adminAmount * 2) / 5);
-        cnxToken.transfer(admin2, (adminAmount * 2) / 5);
-        cnxToken.transfer(admin3, adminAmount - (adminAmount * 4) / 5);
+        
+        uint256 cnxAmount = (amountUSDT * 1e18) / getCurrentTokenPrice();
+        uint256 userAmount = cnxAmount - ((cnxAmount * 10) / 100) - ((cnxAmount * ADMIN_FEE_BP) / 10000);
+        // 10% Tokens Burned
+        cnxToken.burn(address(this), ((cnxAmount * 10) / 100));
+        // 5% Admin fee transferred
+        cnxToken.transfer(admin, (cnxAmount * ADMIN_FEE_BP) / 10000);
+        // Balance 85% transferred to user
         cnxToken.transfer(msg.sender, userAmount);
+
         user.withdrawableBalance -= amountUSDT;
         user.totalWithdrawn += amountUSDT;
+        user.lastWithdrawTime = block.timestamp;
         emit Withdraw(msg.sender, amountUSDT, userAmount, block.timestamp);
     }
 
     // --- Sell CNX to contract: 100% burned, user receives 95% USDT, 5% stays in contract ---
     function sellCNX(uint256 cnxAmount) external onlyRegistered nonReentrant {
         require(cnxToken.balanceOf(msg.sender) >= cnxAmount, "Not enough CNX");
-        uint256 cnxPrice = getCurrentTokenPrice();
-        uint256 usdtAmount = (cnxAmount * cnxPrice) / 1e18;
+
+        uint256 usdtAmount = (cnxAmount * getCurrentTokenPrice()) / 1e18;
         uint256 payout = (usdtAmount * 95) / 100;
+
         require(usdt.balanceOf(address(this)) >= payout, "Not enough USDT liquidity");
+
         cnxToken.transferFrom(msg.sender, address(this), cnxAmount);
         cnxToken.burn(address(this), cnxAmount);
+
         usdt.transfer(msg.sender, payout);
         // 5% stays in contract for price appreciation
     }
@@ -265,13 +259,18 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
     function claimFastStartBonus() external onlyRegistered nonReentrant {
         User storage user = users[msg.sender];
         require(!user.fastStartClaimed, "Already claimed Fast Start Bonus");
+
         uint256 regTime = user.registrationTime;
+
         require(block.timestamp >= regTime + FASTSTART_WINDOW, "Can claim only after 15 days");
         require(block.timestamp <= regTime + FASTSTART_CLAIM_WINDOW, "Claim window expired");
+
         (uint256[] memory directTopups, uint256 directs15) =
             _getQualifyingDirectTopups(msg.sender, regTime, FASTSTART_WINDOW);
         require(directs15 >= 5, "Not enough qualifying directs in first 15 days");
+
         uint256 bonusAmount;
+
         if (directs15 >= 25) {
             for (uint256 i = 0; i < 25; ++i) bonusAmount += (directTopups[i] * 10) / 100;
             user.fastStartBonus = bonusAmount;
@@ -285,10 +284,13 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
             user.fastStartBonus = bonusAmount;
             user.fastStartEligibleDirects = 5;
         }
+
         require(bonusAmount > 0, "No eligible bonus");
+
         user.withdrawableBalance += bonusAmount;
         user.fastStartClaimed = true;
         user.fastStartClaimTime = block.timestamp;
+
         emit FastStartBonusClaimed(msg.sender, bonusAmount, user.fastStartEligibleDirects, block.timestamp);
     }
 
@@ -307,11 +309,7 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
             bool registered,
             address referrer,
             uint256 directs,
-            uint256 registrationTime,
-            uint256 totalTopup,
-            uint256 totalWithdrawn,
-            uint256 withdrawableBalance,
-            uint256 totalTeamRoiEarned
+            uint256 registrationTime
         )
     {
         User storage u = users[user];
@@ -319,11 +317,7 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
             u.registered,
             u.referrer,
             u.directs,
-            u.registrationTime,
-            u.totalTopup,
-            u.totalWithdrawn,
-            u.withdrawableBalance,
-            u.totalTeamRoiEarned
+            u.registrationTime
         );
     }
 
@@ -374,7 +368,8 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
             uint256 totalTopup,
             uint256 totalReferralBonusEarned,
             uint256 totalTeamRoiEarned,
-            uint256 totalRoiEarned
+            uint256 totalRoiEarned,
+            uint256 fastStartBonus
         )
     {
         User storage u = users[user];
@@ -384,7 +379,8 @@ contract CyranexMLM is ReentrancyGuard, Ownable {
             u.totalTopup,
             u.totalReferralBonusEarned,
             u.totalTeamRoiEarned,
-            u.totalRoiEarned
+            u.totalRoiEarned,
+            u.fastStartBonus
         );
     }
 
